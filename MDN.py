@@ -80,7 +80,7 @@ def load_training_data(npz_path: str | Path) -> tuple[np.ndarray, np.ndarray, np
 
 class FissionYieldMDN(nn.Module):
     """
-    Conditional 3-Gaussian-mixture model for fragment mass given target and energy.
+    Conditional 5-Gaussian-mixture model for fragment mass given target and energy.
     Each mixture component has a weight, mean, and standard deviation.
     The mean is constrained to the training mass range.
     """
@@ -90,8 +90,8 @@ class FissionYieldMDN(nn.Module):
         mass_min: float,
         mass_max: float,
         input_size: int = 3,
-        components: int = 3,
-        hidden_size: int = 32,
+        components: int = 5,
+        hidden_size: int = 64,
     ):
         super().__init__()
         if mass_max <= mass_min:
@@ -99,12 +99,12 @@ class FissionYieldMDN(nn.Module):
         self.components = components
         self.mass_min = mass_min
         self.mass_max = mass_max
-        # feedforward network: input (3 inputs)-> hidden (32 units)-> hidden (32 units)-> output (weights, means, stddevs) for each of the 3 gaussian curves
+        # feedforward network: input (3 inputs)-> hidden (64 units)-> hidden (64 units)-> output (weights, means, stddevs) for each of the 5 gaussian curves
         self.network = nn.Sequential(
             nn.Linear(input_size, hidden_size),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(hidden_size, components * 3),
         )
 
@@ -116,7 +116,9 @@ class FissionYieldMDN(nn.Module):
         means = self.mass_min + (
             self.mass_max - self.mass_min
         ) * torch.sigmoid(raw[:, :, 1])
-        standard_deviations = torch.nn.functional.softplus(raw[:, :, 2]) + 1.0
+        sigma_min = 0.5
+        sigma_max = 30.0
+        standard_deviations = sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw[:, :, 2])
         return weights, means, standard_deviations
 
 
@@ -268,11 +270,12 @@ def evaluate_predictions(
     mass_values: np.ndarray,
     npz_path: str | Path,
     curve_indices: np.ndarray,
-) -> dict[str, float]:
+) -> dict[str, float | np.ndarray]:
     """
     Compare predicted and evaluated yield curves (both scaled to total yield 2).
 
-    Metrics, averaged over the given curves:
+    "chi2_per_curve" holds chi^2/N for each curve in curve_indices (NaN where the
+    curve has no non-zero uncertainties). The other metrics are averaged over the curves:
     - RMSE (yield %): root-mean-square difference over mass bins that have data.
     - Reduced chi-squared: chi^2/N using the ENDF yield uncertainties. A value
       near 1 means the prediction agrees with the data within its quoted
@@ -320,10 +323,11 @@ def evaluate_predictions(
             rmse_values.append(100.0 * np.sqrt(np.mean(residuals ** 2)))
 
             has_error = errors > 0
-            if np.any(has_error):
-                chi2_values.append(
-                    np.mean((residuals[has_error] / errors[has_error]) ** 2)
-                )
+            chi2_values.append(
+                np.mean((residuals[has_error] / errors[has_error]) ** 2)
+                if np.any(has_error)
+                else np.nan
+            )
 
             # KL divergence on the full mass grid, using probabilities (sum to 1).
             p = np.zeros(len(mass_values))
@@ -332,11 +336,32 @@ def evaluate_predictions(
             nonzero = p > 0
             kl_values.append(np.sum(p[nonzero] * np.log(p[nonzero] / q[nonzero])))
 
+    chi2_per_curve = np.array(chi2_values, dtype=np.float64)
+    has_chi2 = ~np.isnan(chi2_per_curve)
     return {
         "rmse_percent": float(np.mean(rmse_values)),
-        "reduced_chi2": float(np.mean(chi2_values)) if chi2_values else float("nan"),
+        "reduced_chi2": (
+            float(np.mean(chi2_per_curve[has_chi2])) if np.any(has_chi2) else float("nan")
+        ),
+        "chi2_per_curve": chi2_per_curve,
         "kl_divergence": float(np.mean(kl_values)),
     }
+
+
+def find_curve_index(
+    npz_path: str | Path,
+    target_Z: int,
+    target_A: int,
+    incident_energy_MeV: float,
+) -> int | None:
+    """Return the index of the first evaluated curve matching the inputs, or None."""
+    with np.load(npz_path, allow_pickle=False) as data:
+        matches = np.flatnonzero(
+            (data["target_Z"] == target_Z)
+            & (data["target_A"] == target_A)
+            & np.isclose(data["incident_energy_MeV"], incident_energy_MeV)
+        )
+    return int(matches[0]) if matches.size else None
 
 
 if __name__ == "__main__":
@@ -353,19 +378,48 @@ if __name__ == "__main__":
         f"reduced chi^2 = {metrics['reduced_chi2']:.3f}, "
         f"KL divergence = {metrics['kl_divergence']:.4f}"
     )
+    target_Z, target_A, incident_energy_MeV = 92, 235, 14.0
     prediction = predict_yield_curve(
         model,
         normalization,
         mass_values,
-        target_Z=92,
-        target_A=235,
-        incident_energy_MeV=5.0,
+        target_Z=target_Z,
+        target_A=target_A,
+        incident_energy_MeV=incident_energy_MeV,
     )
     print(f"Trained MDN. Predicted total yield: {prediction.sum():.6f}")
 
-    plt.plot(mass_values, 100.0 * prediction / prediction.sum())
+    prediction_label = "MDN prediction"
+    curve_index = find_curve_index(npz_path, target_Z, target_A, incident_energy_MeV)
+    if curve_index is None:
+        print("No evaluated curve matches these inputs; chi^2/N not computed.")
+    else:
+        curve_chi2 = evaluate_predictions(
+            model, normalization, mass_values, npz_path, np.array([curve_index])
+        )["chi2_per_curve"][0]
+        split = "validation" if curve_index in validation_indices else "training"
+        print(f"chi^2/N for curve {curve_index} ({split} set) = {curve_chi2:.3f}")
+        prediction_label += f" ($\\chi^2/N$ = {curve_chi2:.3f}, {split} curve)"
+
+        with np.load(npz_path, allow_pickle=False) as data:
+            start, end = data["offsets"][curve_index:curve_index + 2]
+            curve_yields = data["yields"][start:end]
+            scale = 100.0 / curve_yields.sum()
+            plt.errorbar(
+                data["fragment_A"][start:end],
+                curve_yields * scale,
+                yerr=data["yield_uncertainties"][start:end] * scale,
+                fmt=".",
+                color="black",
+                label="ENDF evaluation",
+            )
+
+    plt.plot(mass_values, 100.0 * prediction / prediction.sum(), label=prediction_label)
     plt.xlabel("Fragment mass number")
-    plt.ylabel("Predicted yield (%)")
-    plt.title("Predicted Cm-246 mass-yield distribution at 0.2 MeV")
+    plt.ylabel("Yield (%)")
+    plt.title(
+        f"Z={target_Z}, A={target_A} mass-yield distribution at {incident_energy_MeV} MeV"
+    )
+    plt.legend()
     plt.grid(True, alpha=0.3)
     plt.show()
